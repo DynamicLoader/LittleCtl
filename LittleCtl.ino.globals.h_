@@ -1,0 +1,16 @@
+// https://arduino-esp8266.readthedocs.io/en/3.1.2/faq/a06-global-build-options.html
+
+/*@create-file:build.opt@
+// An embedded build.opt file using a "C" block comment. The starting signature
+// must be on a line by itself. The closing block comment pattern should be on a
+// line by itself. Each line within the block comment will be space trimmed and
+// written to build.opt, skipping blank lines and lines starting with '//', '*'
+// or '#'.
+
+ * this line is ignored
+ # this line is ignored
+-g
+-Og
+-O0
+*/
+

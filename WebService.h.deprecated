@@ -1,0 +1,173 @@
+
+#include <WiFiUdp.h>
+#include <WiFiClient.h>
+#include <ESP8266WebServer.h>
+#include <FS.h>
+
+class WebService {
+    ESP8266WebServer& server;
+    Stream& logger;
+    FS& fs;
+
+    bool _allowUpdate = false;
+
+public:
+    WebService(ESP8266WebServer& _server, Stream& _logger, FS& _fs)
+        : server(_server)
+        , logger(_logger)
+        , fs(_fs)
+    {
+        // index page
+        server.on("/", HTTP_GET, [&]() {
+            server.sendHeader("Connection", "close");
+            server.send(200, "text/html",
+                "<h1>SimpleServerController</h1>"
+                "<p><a href='/update'>Update</a></p>"
+                "<p><a href='/log'>All Logs</a></p>"
+                "<p><a href='/log/current'>Current Log</a></p>");
+        });
+        // logs page
+        server.serveStatic("/log/", fs, "/log/");
+        server.on("/log", HTTP_GET, [&]() {
+            _logger.println("Log page requested");
+
+            server.sendHeader("Connection", "close");
+
+            String html = "<h1>Log File List</h1>";
+            html.reserve(3072); // reserve for the HTML content
+
+            const int ITEMS_PER_PAGE_DEFAULT = 25;
+
+            int page = server.arg("page").toInt() - 1; // 获取页码，默认从1开始
+            if (page < 0)
+                page = 0; // 如果没有提供或无效，则设置为第一页
+            if (page * ITEMS_PER_PAGE_DEFAULT > 700) {
+                html += "Too many pages!";
+                server.send(200, "text/html", html);
+                return;
+            }
+
+            html += "<table border=1 cellpadding=5 cellspacing=0><tr><th>File</th><th>Size</th><th>Last Written</th></tr>";
+
+            Dir dir = fs.openDir("/log");
+            // _logger.println("Opened /log directory");
+            int totalFiles = 0;
+            int minIdx = INT_MAX;
+            int maxIdx = INT_MIN;
+            while (dir.next()) {
+                // _logger.print("*");
+                if (dir.isFile()) {
+                    totalFiles++;
+                    int idx = dir.fileName().toInt();
+                    if (idx < minIdx)
+                        minIdx = idx;
+                    if (idx > maxIdx)
+                        maxIdx = idx;
+
+                    if (idx < page * ITEMS_PER_PAGE_DEFAULT || idx >= (page + 1) * ITEMS_PER_PAGE_DEFAULT)
+                        continue;
+                    auto& file = dir;
+                    time_t cr = file.fileTime();
+                    auto sz = file.fileSize();
+                    struct tm* tmstruct = localtime(&cr);
+                    html += "<tr><td><a href='/log/" + file.fileName() + "'>" + String(idx) + "</a></td><td>" + String(sz) + " B</td><td>"
+                        + String(tmstruct->tm_year + 1900) + "/" + String(tmstruct->tm_mon + 1) + "/"
+                        + String(tmstruct->tm_mday) + " " + String(tmstruct->tm_hour) + ":"
+                        + String(tmstruct->tm_min) + ":" + String(tmstruct->tm_sec) + "</td></tr>";
+                }
+            }
+            // _logger.println("All files listed");
+            html += "</table>";
+
+            if (maxIdx == INT_MIN || minIdx == INT_MAX) {
+                html += "<b>No log files found!</b><br>";
+                server.send(200, "text/html", html);
+                return;
+            }
+            if (maxIdx - minIdx + 1 < totalFiles) {
+                html += "<b>Log files are not continuous, some files may be missing!</b><br>";
+                return;
+            }
+
+            int totalPages = (totalFiles + ITEMS_PER_PAGE_DEFAULT - 1) / ITEMS_PER_PAGE_DEFAULT;
+            if (page >= totalPages) {
+                html += "<b>Page is too large, some files may be missing!</b><br>";
+            }
+
+            html += "<form action='/log' method='get'> Page " + String(page + 1) + " / " + String(totalPages) + 
+                    " | To <input type='number' name='page' min='1' max='"
+                + String(totalPages) + "' value='" + String(page + 1)
+                + "'><input type='submit' value='Go'></form>";
+            
+            _logger.println("Sending log page");
+            server.send(200, "text/html", html);
+        });
+
+        // update page
+        server.on("/up", HTTP_GET, [&]() {
+            server.sendHeader("Connection", "close");
+            server.send(200, "text/html",
+                "<form method='POST' action='/update' enctype='multipart/form-data'>"
+                "<input type='file' name='update'>"
+                "<input type='submit' value='Update'>"
+                "</form>");
+        });
+        // handling updating
+        server.on(
+            "/update", HTTP_POST,
+            [&]() {
+                if (!_allowUpdate) {
+                    server.sendHeader("Connection", "close");
+                    server.send(404, "text/plain", "Not Found");
+                    return;
+                }
+                server.sendHeader("Connection", "close");
+                server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
+                ESP.restart();
+            },
+            [&]() {
+                if (!_allowUpdate) {
+                    server.sendHeader("Connection", "close");
+                    server.send(404, "text/plain", "Not Found");
+                    return;
+                }
+                HTTPUpload& upload = server.upload();
+                if (upload.status == UPLOAD_FILE_START) {
+                    WiFiUDP::stopAll();
+                    logger.printf("Update: %s\n", upload.filename.c_str());
+                    uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+                    if (!Update.begin(maxSketchSpace)) { // start with max available size
+                        Update.printError(logger);
+                    }
+                } else if (upload.status == UPLOAD_FILE_WRITE) {
+                    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+                        Update.printError(logger);
+                    }
+                } else if (upload.status == UPLOAD_FILE_END) {
+                    if (Update.end(true)) { // true to set the size to the current progress
+                        logger.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
+                    } else {
+                        Update.printError(logger);
+                    }
+                }
+                yield();
+            });
+
+        // not found
+        server.onNotFound([&]() {
+            server.sendHeader("Connection", "close");
+            server.send(404, "text/plain", "Not Found");
+        });
+    }
+
+    void
+    allowUpdate(bool allow)
+    {
+        _allowUpdate = allow;
+    }
+
+    bool allowUpdate() const
+    {
+        return _allowUpdate;
+    }
+};
