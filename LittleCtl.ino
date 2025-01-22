@@ -33,6 +33,11 @@ EEPROMVar<uint16_t> SerialRxBufSz(4);
 // 2bytes left
 EEPROMVar<uint32_t> ConsoleBaud(8);
 
+EEPROMVar<uint32_t> Ip(12);
+EEPROMVar<uint32_t> Gateway(16);
+EEPROMVar<uint32_t> Subnet(20);
+EEPROMVar<uint32_t> Dns1(24);
+
 // *** EEPROM variables ***
 
 Ticker timeConfigTicker;
@@ -86,6 +91,8 @@ bool initCfg()
             EEPROM.commitReset();
         else
             EEPROM.commit();
+
+        resetFlag = true;
     }
     return resetFlag;
 }
@@ -148,6 +155,15 @@ void setup()
     });
 
     wm.setConfigPortalTimeout(300); // 5 minutes
+    wm.setShowDnsFields(true);
+    wm.setShowStaticFields(true);
+    if (!resetFlag) {
+        auto CliIp = IPAddress(Ip);
+        auto CliGateway = IPAddress(Gateway);
+        auto CliSubnet = IPAddress(Subnet);
+        auto CliDns1 = IPAddress(Dns1);
+        wm.setSTAStaticIPConfig(CliIp, CliGateway, CliSubnet, CliDns1);
+    }
 
     bool res;
     if (!(res = wm.autoConnect())) {
@@ -162,7 +178,7 @@ void setup()
     // Register event handlers
     WiFi.onStationModeDisconnected([](const WiFiEventStationModeDisconnected& event) {
         logger.println("Disconnected from WiFi, rebooting in 5s...");
-        if(hasStartedConsoleLogger)
+        if (hasStartedConsoleLogger)
             consoleLogger.end();
         Serial.end();
         termServer.stop();
@@ -191,6 +207,11 @@ void setup()
             logger.println("Invalid RX buffer size, using default");
         else
             SerialRxBufSz = l;
+
+        Ip = WiFi.localIP();
+        Gateway = WiFi.gatewayIP();
+        Subnet = WiFi.subnetMask();
+        Dns1 = WiFi.dnsIP();
 
         EEPROM.commit();
     }
@@ -253,7 +274,8 @@ void handleTerm(char* cbuf, int csize)
         // actions
         CMD_RESET,
         CMD_SHUTDOWN,
-        CMD_POWEROFF } SuperCmd
+        CMD_POWEROFF,
+        CMD_SELFRESET } SuperCmd
         = CMD_NONE;
     static Ticker superCmdTicker;
 
@@ -352,11 +374,17 @@ void handleTerm(char* cbuf, int csize)
                     pinMode(PIN_PWRBTN, OUTPUT_OPEN_DRAIN);
                     digitalWrite(PIN_PWRBTN, LOW);
                     SuperCmd = CMD_EXEC;
-                    superCmdTicker.once_ms(3000, [&]() {
+                    superCmdTicker.once_ms(10000, [&]() {
                         digitalWrite(PIN_PWRBTN, HIGH);
                         pinMode(PIN_PWRBTN, INPUT);
                         SuperCmd = CMD_NONE;
                     });
+                    break;
+                case CMD_SELFRESET:
+                    termOut.println("Self resetting...");
+                    output();
+                    delay(1000);
+                    ESP.restart();
                     break;
                 }
                 break;
@@ -378,6 +406,12 @@ void handleTerm(char* cbuf, int csize)
                 else
                     SuperCmd = CMD_NONE;
                 break;
+            case 'E':
+                if (SuperCmd == CMD_WAIT_ACTION)
+                    SuperCmd = CMD_SELFRESET;
+                else
+                    SuperCmd = CMD_NONE;
+                break;
 
             case 'V':
                 termOut.println("LittleCtl v1.0.0");
@@ -387,14 +421,19 @@ void handleTerm(char* cbuf, int csize)
                 termOut.println("Dump console: " + String(dumpConsoleEn ? "Enabled" : "Disabled"));
                 break;
 
-            case 'M':
+            case 'M': {
                 termOut.printf("Free heap: %u\n", ESP.getFreeHeap());
                 termOut.printf("Serial baud: %u\n", (uint32_t)SerialBaud);
                 termOut.printf("Serial RX buffer size: %u\n", (uint16_t)SerialRxBufSz);
                 termOut.printf("Console baud: %u\n", (uint32_t)ConsoleBaud);
                 termOut.printf("Power state: %s\n", pwrState ? "ON" : "OFF");
                 termOut.printf("Log Service: %s\n", hasStartedConsoleLogger ? "Started" : "Not started");
-                break;
+                time_t now = time(nullptr);
+                struct tm* timeinfo = localtime(&now);
+                termOut.printf("Current time: %04d-%02d-%02d %02d:%02d:%02d\n",
+                    timeinfo->tm_year + 1900, timeinfo->tm_mon + 1, timeinfo->tm_mday,
+                    timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+            } break;
 
             case 'L': // List all logs
             {
@@ -431,10 +470,11 @@ void handleTerm(char* cbuf, int csize)
             }
 
             // State machine fallback
-            if (SuperCmd == CMD_WAIT_ACTION && a != 'R' && a != 'S' && a != 'P' && a != '#') {
+            if (SuperCmd == CMD_WAIT_ACTION && a != 'R' && a != 'S' && a != 'P' && a != 'E' && a != '#') {
                 SuperCmd = CMD_NONE;
             }
-            if ((SuperCmd == CMD_POWEROFF || SuperCmd == CMD_SHUTDOWN || SuperCmd == CMD_RESET) && a != '$' && a != 'R' && a != 'S' && a != 'P') {
+            if ((SuperCmd == CMD_POWEROFF || SuperCmd == CMD_SHUTDOWN || SuperCmd == CMD_RESET || SuperCmd == CMD_SELFRESET)
+                && a != '$' && a != 'R' && a != 'S' && a != 'P' && a != 'E') {
                 SuperCmd = CMD_NONE;
             }
 
